@@ -11,8 +11,11 @@ def readme():
     with open('README.md') as f:
         return f.read()
 
-extra_compile_args = ["-std=c++11"]
-extra_link_args = ["-std=c++11"]
+
+extra_compile_args = ["-std=c++0x"]
+extra_link_args = ["-std=c++0x"]
+#extra_compile_args = ["-std=c++11"]
+#extra_link_args = ["-std=c++11"]
 #extra_compile_args = ["-std=gnu++11"]
 #extra_link_args = ["-std=gnu++11"]
 
