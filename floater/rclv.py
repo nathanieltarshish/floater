@@ -9,6 +9,8 @@ from scipy.spatial import qhull
 from tqdm import tqdm
 from time import time
 
+R_earth = 6.371e6
+
 def polygon_area(verts):
     """Compute the area of a polygon.
 
@@ -27,10 +29,11 @@ def polygon_area(verts):
     # use scikit image convetions (j,i indexing)
     area_elements = ((verts_roll[:,1] + verts[:,1]) *
                      (verts_roll[:,0] - verts[:,0]))
-    return area_elements.sum()/2.0
+    # absolute value makes results independent of orientation
+    return abs(area_elements.sum())/2.0
 
 
-def get_local_region(data, ji, border_j, border_i):
+def get_local_region(data, ji, border_j, border_i, periodic=(False, False)):
     #print("get_local_region " + repr(ji) + repr(border_i) + repr(border_j))
     j, i = ji
     nj, ni = data.shape
@@ -39,11 +42,90 @@ def get_local_region(data, ji, border_j, border_i):
     imin = i - border_i[0]
     imax = i + border_i[1] + 1
 
-    if (jmin < 0) or (imin < 0) or (jmax >= nj) or (imax >= ni):
-        raise ValueError("Limits " + repr(((jmin, jmax), (imin, imax))) +
-                         " outside of array shape " + repr((nj,ni)))
+    # we could easily implement wrapping with take
+    # https://docs.scipy.org/doc/numpy/reference/generated/numpy.take.html
+    # unfortunately, take is ~1000000 times slower than raw indexing and copies
+    # the data. So we need to slice and concatenate
 
-    return (j - jmin, i - imin), data[j,i] - data[jmin:jmax, imin:imax]
+    concat_down = (jmin < 0)
+    concat_up = (jmax > nj)
+    concat_left = (imin < 0)
+    concat_right = (imax > ni)
+
+    # check for valid region limits
+    if (concat_left or concat_right) and not periodic[1]:
+        raise ValueError("Region i-axis limits " + repr((imin, imax)) +
+                         " outside of array shape " + repr((nj,ni)) +
+                         " and i-axis is not periodic")
+    if (concat_up or concat_down) and not periodic[0]:
+        raise ValueError("Region j-axis limits " + repr((jmin, jmax)) +
+                         " outside of array shape " + repr((nj,ni)) +
+                         " and j-axis is not periodic")
+    if (concat_left and concat_right) or (concat_up and concat_down):
+        raise ValueError("Can't concatenate on more than one side on the same "
+                         "axis. Limits are " +
+                         repr(((jmin, jmax), (imin, imax))))
+
+    # limits for central region
+    imin_reg = max(imin, 0)
+    imax_reg = min(imax, ni)
+    jmin_reg = max(jmin, 0)
+    jmax_reg = min(jmax, nj)
+    data_center = data[jmin_reg:jmax_reg, imin_reg:imax_reg]
+
+    if concat_down:
+        data_down = data[jmin:, imin_reg:imax_reg]
+    if concat_up:
+        data_up = data[:(jmax - nj), imin_reg:imax_reg]
+    if concat_left:
+        data_left= data[jmin_reg:jmax_reg, imin:]
+    if concat_right:
+        data_right = data[jmin_reg:jmax_reg, :(imax - ni)]
+
+    # corner cases
+    if concat_down and concat_left:
+        data_down_left = data[jmin:, imin:]
+    if concat_down and concat_right:
+        data_down_right = data[jmin:, :(imax - ni)]
+    if concat_up and concat_left:
+        data_up_left = data[:(jmax - nj), imin:]
+    if concat_up and concat_right:
+        data_up_right = data[:(jmax - nj), :(imax - ni)]
+
+    # now put things together, starting with the corner cases
+    # it feels like there must be a more elegant way to do this
+    if concat_down and concat_left:
+        data_reg = np.concatenate(
+                        (np.concatenate((data_down_left, data_down), axis=1),
+                         np.concatenate((data_left, data_center), axis=1)),
+                        axis=0)
+    elif concat_down and concat_right:
+        data_reg = np.concatenate(
+                        (np.concatenate((data_down, data_down_right), axis=1),
+                         np.concatenate((data_center, data_right), axis=1)),
+                        axis=0)
+    elif concat_up and concat_left:
+        data_reg = np.concatenate(
+                        (np.concatenate((data_left, data_center), axis=1),
+                         np.concatenate((data_up_left, data_up), axis=1)),
+                        axis=0)
+    elif concat_up and concat_right:
+        data_reg = np.concatenate(
+                        (np.concatenate((data_center, data_right), axis=1),
+                         np.concatenate((data_up, data_up_right), axis=1)),
+                        axis=0)
+    elif concat_down:
+        data_reg = np.concatenate((data_down, data_center), axis=0)
+    elif concat_up:
+        data_reg = np.concatenate((data_center, data_up), axis=0)
+    elif concat_left:
+        data_reg = np.concatenate((data_left, data_center), axis=1)
+    elif concat_right:
+        data_reg = np.concatenate((data_center, data_right), axis=1)
+    else:
+        data_reg = data_center
+
+    return (j - jmin, i - imin), data[j,i] - data_reg
 
 
 def is_contour_closed(con):
@@ -75,7 +157,7 @@ def contour_area(con):
     con_points = con[:,::-1]
 
     # calculate area of polygon
-    region_area = abs(polygon_area(con_points))
+    region_area = polygon_area(con_points)
 
     # find convex hull
     hull = qhull.ConvexHull(con_points)
@@ -87,8 +169,43 @@ def contour_area(con):
     return region_area, hull_area, cd
 
 
+def project_vertices(verts, lon0, lat0, dlon, dlat):
+    """Project the logical coordinates of vertices into physical map
+    coordiantes.
+
+    Parameters
+    ----------
+    verts : arraylike
+        A 2D array of vertices with shape (N,2) that follows the scikit
+        image conventions (con[:,0] are j indices)
+    lon0, lat0 : float
+        center lon and lat for the projection
+    dlon, dlat : float
+        spacing of points in longitude
+    dlat : float
+        spacing of points in latitude
+
+    Returns
+    -------
+    verts_proj : arraylike
+        A 2D array of projected vertices with shape (N,2) that follows the
+        scikit image conventions (con[:,0] are j indices)
+    """
+
+    i, j = verts[:, 1], verts[:, 0]
+
+    # use the simplest local tangent plane projection
+    dy = (np.pi * R_earth / 180.)
+    dx = dy * np.cos(np.radians(lat0))
+    x = dx * dlon *i
+    y = dy * dlat * j
+
+    return np.vstack([y, x]).T
+
+
 def find_contour_around_maximum(data, ji, level, border_j=(5,5),
-        border_i=(5,5), max_footprint=None):
+        border_i=(5,5), max_footprint=None, proj_kwargs={},
+        periodic=(False, False)):
     j,i = ji
     max_val = data[j,i]
 
@@ -117,7 +234,9 @@ def find_contour_around_maximum(data, ji, level, border_j=(5,5),
         # TODO: define a max_area flag to know when to stop growing
 
         # find the local region
-        (j_rel, i_rel), region_data = get_local_region(data, (j,i), border_j, border_i)
+        (j_rel, i_rel), region_data = get_local_region(data, (j,i),
+                                                       border_j, border_i,
+                                                       periodic=periodic)
         nj, ni = region_data.shape
 
         # extract the contours
@@ -155,7 +274,8 @@ def find_contour_around_maximum(data, ji, level, border_j=(5,5),
 
 def convex_contour_around_maximum(data, ji, step, border=5,
                                   convex_def=0.01, verbose=False,
-                                  max_footprint=None):
+                                  max_footprint=None, proj_kwargs=None,
+                                  periodic=(False, False)):
     """Find the largest convex contour around a maximum.
 
     Parameters
@@ -171,8 +291,14 @@ def convex_contour_around_maximum(data, ji, step, border=5,
     convex_def : float, optional
         The maximum convexity deficiency allowed for the contour
         before the seach stops.
-    verbose: bool, optional
+    verbose : bool, optional
         Whether to print out diagnostic information
+    proj_kwargs : dict, optional
+        Information for projecting the contour into spatial coordinates. Should
+        contain entries `lon0`, `lat0`, `dlon`, and `dlat`.
+    periodic : tuple
+        Tuple of bools which specificies the periodicity of each axis (j, i) of
+        the data
 
     Returns
     -------
@@ -210,16 +336,21 @@ def convex_contour_around_maximum(data, ji, step, border=5,
             # try to get a contour
             contour, region_data, border_j, border_i = find_contour_around_maximum(
                 data, (j,i), level, border_j, border_i,
-                max_footprint=max_footprint)
+                max_footprint=max_footprint, periodic=periodic)
         except ValueError as ve:
             if verbose:
                 print(ve)
             break
 
         # get the convexity deficiency
-        region_area, hull_area, cd = contour_area(contour)
+        if proj_kwargs is None:
+            contour_proj = contour
+        else:
+            contour_proj = project_vertices(contour, **proj_kwargs)
+
+        region_area, hull_area, cd = contour_area(contour_proj)
         if verbose:
-            print('  region_area: % 6.1f, hull_area: % 6.1f, convex_def: % 6.5e '
+            print('  region_area: % 6.1f, hull_area: % 6.1f, convex_def: % 6.5e'
                   % (region_area, hull_area, cd))
 
         if cd > convex_def:
@@ -243,7 +374,8 @@ def convex_contour_around_maximum(data, ji, step, border=5,
 def find_convex_contours(data, min_distance=5, min_area=100.,
                              max_footprint=10000,
                              step=1e-7, convex_def=0.001, verbose=False,
-                             use_threadpool=False):
+                             use_threadpool=False, lon=None, lat=None,
+                             periodic=(False, False)):
     """Find the outermost convex contours around the maxima of
     data with specified convexity deficiency.
 
@@ -254,20 +386,26 @@ def find_convex_contours(data, min_distance=5, min_area=100.,
     min_distance : int, optional
         The minimum distance around maxima
     min_area : float, optional
-        The minimum area of the regions
-    max_footprint: int, optional
-        The maximum area of the footprint in which to search for contours
+        The minimum area of the regions (pixels or projected if `lon` and `lat`
+        are specified)
+    max_footprint : int, optional
+        The maximum area (in pixels) of the footprint in which to search for
+        contours
     step : float, optional
         the step size with which to increment the contour level
     convex_def : float, optional
         The maximum convexity deficiency allowed for the contour
         before the seach stops.
-    verbose: bool, optional
+    verbose : bool, optional
         Whether to print out diagnostic information
     use_threadpool : bool, optional
         Whether to map each maximum using a multiprocessing.ThreadPool
-    progress: bool, optional
-        Whether to show a progress bar for the iteration through maxima
+    lon, lat : arraylike
+        Longitude and latitude of data points. Should be 1D arrays such that
+        ``len(lon) == data.shape[1]`` and ``len(lat) == data.shape[0]``
+    periodic : tuple
+        Tuple of bools which specificies the periodicity of each axis (j, i) of
+        the data
 
     Yields
     -------
@@ -275,8 +413,23 @@ def find_convex_contours(data, min_distance=5, min_area=100.,
         2D array of contour vertices with shape (N,2) that follows
         the scikit image conventions (contour[:,0] are j indices)
     area : float
-        The area enclosed by the contour
+        The area enclosed by the contour (in pixels or projected if
+        `lon` and `lat` are specified)
     """
+
+    # do some checks on the coordinates if they are specified
+    if (lon is not None) or (lat is not None):
+        if not ((len(lat) == data.shape[0]) and (len(lon) == data.shape[1])):
+            raise ValueError('`lon` or `lat` have the incorrect length')
+        dlon = lon[1] - lon[0]
+        dlat = lat[1] - lat[0]
+        # make sure that the lon and lat are evenly spaced
+        if not (np.allclose(np.diff(lon), dlon) and
+                np.allclose(np.diff(lat), dlat)):
+            raise ValueError('`lon` and `lat` need to be evenly spaced')
+        proj = True
+    else:
+        proj = False
 
     if use_threadpool:
         from multiprocessing.pool import ThreadPool
@@ -297,11 +450,15 @@ def find_convex_contours(data, min_distance=5, min_area=100.,
         tic = time()
         result = None
         if data[tuple(ji)] > step:
-            # only makes sense to look for contours is the value of the maximum
+            # only makes sense to look for contours if the value of the maximum
             # is greater than the contour step size
+            proj_kwargs = {'lon0': lon[ji[1]], 'lat0': lat[ji[0]],
+                               'dlon': dlon, 'dlat': dlat} if proj else None
+
             contour, area = convex_contour_around_maximum(data, ji, step,
                 border=min_distance, convex_def=convex_def, verbose=verbose,
-                max_footprint=max_footprint)
+                max_footprint=max_footprint, proj_kwargs=proj_kwargs,
+                periodic=periodic)
             if area and (area >= min_area):
                 result = ji, contour, area
         toc = time()
@@ -333,20 +490,41 @@ def label_points_in_contours(shape, contours):
     """
 
     assert len(shape)==2
-
-    data = np.zeros(shape, dtype='i4')
+    ny, nx = shape
 
     # modify data in place with this function
-    def fill_in_contour(contour, value=1):
+    def fill_in_contour(contour, label_data, value=1):
         ymin, xmin = (np.floor(contour.min(axis=0)) - 1).astype('int')
         ymax, xmax = (np.ceil(contour.max(axis=0)) + 1).astype('int')
+        print(((ymin, ymax), (xmin, xmax)))
+        # possibly roll the data to deal with periodicity
+        roll_x, roll_y = 0, 0
+        if ymin < 0:
+            roll_y = -ymin
+        if ymax > ny:
+            roll_y = ny - ymax
+        if xmin < 0:
+            roll_x = -xmin
+        if xmax > nx:
+            roll_x = nx - xmax
+
+        contour_rel = contour - np.array([ymin, xmin])
+
+        ymax += roll_y
+        ymin += roll_y
+        xmax += roll_x
+        xmin += roll_x
+
+        data = np.roll(np.roll(label_data, roll_x, axis=1), roll_y, axis=0)
         region_slice = (slice(ymin,ymax), slice(xmin,xmax))
         region_data = data[region_slice]
-        contour_rel = contour - np.array([ymin, xmin])
         data[region_slice] = value*grid_points_in_poly(region_data.shape,
                                                        contour_rel)
 
-    for n, con in enumerate(contours):
-        fill_in_contour(con, n+1)
+        return np.roll(np.roll(data, -roll_x, axis=1), -roll_y, axis=0)
 
-    return data
+    labels = np.zeros(shape, dtype='i4')
+    for n, con in enumerate(contours):
+        labels = fill_in_contour(con, labels, n+1)
+
+    return labels
