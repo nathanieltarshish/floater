@@ -12,8 +12,8 @@ python:
   - 3.6
 
 env:
-  - CONDA_PACKAGES="numpy scipy  pandas bcolz pytest future xarray dask scikit-image"
-    PIP_PACKAGES="tqdm codecov pytest-cov"
+  - CONDA_PACKAGES="numpy scipy pandas bcolz pytest future xarray dask scikit-image"
+    PIP_PACKAGES="tqdm codecov pytest-cov tqdm"
 
 before_install:
   - if [[ "$TRAVIS_PYTHON_VERSION" == "2.7" ]]; then

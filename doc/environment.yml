@@ -1,0 +1,13 @@
+name: floater
+dependencies:
+  - python=2.7
+  - numpydoc
+  - sphinx
+  - numpy
+  - scipy
+  - scikit-image
+  - pandas
+  - xarray
+  - bcolz
+  - pip:
+    - tqdm
